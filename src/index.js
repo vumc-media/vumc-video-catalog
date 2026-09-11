@@ -1,6 +1,15 @@
 const PUBLIC_R2_BASE =
   "https://pub-b27dbb9301fa4d12b052a98a92aabbaf.r2.dev";
 
+const COVER_FILENAMES = new Set([
+  "poster.jpg",
+  "poster.jpeg",
+  "poster.png",
+  "cover.jpg",
+  "cover.jpeg",
+  "cover.png"
+]);
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -15,10 +24,11 @@ export default {
 
     try {
       const objects = await listAllObjects(env.MEDIA);
+      const covers = buildCoverMap(objects);
 
       const videos = objects
         .filter((object) => object.key.toLowerCase().endsWith(".mp4"))
-        .map((object) => makeVideo(object))
+        .map((object) => makeVideo(object, covers))
         .sort(sortVideos);
 
       return new Response(buildMRSS(videos), {
@@ -49,15 +59,33 @@ async function listAllObjects(bucket) {
   return objects;
 }
 
-function makeVideo(object) {
+function buildCoverMap(objects) {
+  const covers = new Map();
+
+  for (const object of objects) {
+    const parts = object.key.split("/");
+    const filename = parts.pop().toLowerCase();
+    const folder = parts.join("/");
+
+    if (folder && COVER_FILENAMES.has(filename) && !covers.has(folder)) {
+      covers.set(folder, PUBLIC_R2_BASE + "/" + encodeObjectKey(object.key));
+    }
+  }
+
+  return covers;
+}
+
+function makeVideo(object, covers) {
   const parts = object.key.split("/");
   const filename = parts.pop();
+  const folder = parts.join("/");
 
   return {
     key: object.key,
-    series: parts.length ? parts.join(" / ") : "Worship",
+    series: folder ? parts.join(" / ") : "Worship",
     title: cleanTitle(filename),
-    uploaded: object.uploaded
+    uploaded: object.uploaded,
+    coverUrl: folder ? (covers.get(folder) || "") : ""
   };
 }
 
@@ -81,13 +109,16 @@ function buildMRSS(videos) {
   const items = videos.map((video) => {
     const videoUrl = PUBLIC_R2_BASE + "/" + encodeObjectKey(video.key);
     const guid = "vumc-" + simpleSlug(video.key);
+    const thumbnail = video.coverUrl
+      ? `\n      <media:thumbnail url="${xmlEscape(video.coverUrl)}" />`
+      : "";
 
     return `
     <item>
       <title>${xmlEscape(video.title)}</title>
       <description>${xmlEscape(video.series)}</description>
       <category>${xmlEscape(video.series)}</category>
-      <guid isPermaLink="false">${xmlEscape(guid)}</guid>
+      <guid isPermaLink="false">${xmlEscape(guid)}</guid>${thumbnail}
       <media:content url="${xmlEscape(videoUrl)}" type="video/mp4" />
     </item>`;
   }).join("");
