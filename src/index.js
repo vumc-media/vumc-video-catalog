@@ -2,9 +2,11 @@ const PUBLIC_R2_BASE =
   "https://pub-b27dbb9301fa4d12b052a98a92aabbaf.r2.dev";
 
 const COVER_FILENAMES = new Set([
-  "poster.jpg", "poster.jpeg", "poster.png",
-  "cover.jpg", "cover.jpeg", "cover.png"
+  "poster.jpg", "poster.jpeg", "poster.png", "poster.webp",
+  "cover.jpg", "cover.jpeg", "cover.png", "cover.webp"
 ]);
+
+const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp"];
 
 export default {
   async fetch(request, env) {
@@ -24,18 +26,24 @@ export default {
     try {
       const objects = await listAllObjects(env.MEDIA);
       const covers = buildCoverMap(objects);
+      const thumbnails = buildThumbnailMap(objects);
 
-      const videos = objects
+      const sourceVideos = objects
         .filter((object) =>
           object.key.toLowerCase().endsWith(".mp4")
         )
-        .map((object) => makeVideo(object, covers))
-        .sort(sortVideos);
+        .map((object) =>
+          makeVideo(object, covers, thumbnails)
+        );
+
+      const videos =
+        addLatestStream(sourceVideos).sort(sortVideos);
 
       return new Response(buildMRSS(videos), {
         headers: {
-          "Content-Type": "application/rss+xml; charset=UTF-8",
-          "Cache-Control": "public, max-age=60"
+          "Content-Type":
+            "application/rss+xml; charset=UTF-8",
+          "Cache-Control": "no-store"
         }
       });
     } catch (error) {
@@ -52,9 +60,7 @@ async function listAllObjects(bucket) {
   let cursor;
 
   do {
-    const options = {
-      limit: 1000
-    };
+    const options = { limit: 1000 };
 
     if (cursor) {
       options.cursor = cursor;
@@ -67,7 +73,6 @@ async function listAllObjects(bucket) {
     cursor = result.truncated
       ? result.cursor
       : undefined;
-
   } while (cursor);
 
   return objects;
@@ -88,7 +93,9 @@ function buildCoverMap(objects) {
     ) {
       covers.set(
         folder,
-        PUBLIC_R2_BASE + "/" + encodeObjectKey(object.key)
+        PUBLIC_R2_BASE +
+          "/" +
+          encodeObjectKey(object.key)
       );
     }
   }
@@ -96,7 +103,47 @@ function buildCoverMap(objects) {
   return covers;
 }
 
-function makeVideo(object, covers) {
+function buildThumbnailMap(objects) {
+  const thumbnails = new Map();
+
+  for (const object of objects) {
+    const key = object.key;
+    const lowerKey = key.toLowerCase();
+
+    const extension = IMAGE_EXTENSIONS.find(
+      (ext) => lowerKey.endsWith(ext)
+    );
+
+    if (!extension) {
+      continue;
+    }
+
+    const parts = key.split("/");
+    const filename = parts.pop();
+
+    // These remain folder/category artwork.
+    if (COVER_FILENAMES.has(filename.toLowerCase())) {
+      continue;
+    }
+
+    // Remove the image extension to match the MP4 name.
+    const matchKey =
+      lowerKey.slice(0, -extension.length);
+
+    if (!thumbnails.has(matchKey)) {
+      thumbnails.set(
+        matchKey,
+        PUBLIC_R2_BASE +
+          "/" +
+          encodeObjectKey(key)
+      );
+    }
+  }
+
+  return thumbnails;
+}
+
+function makeVideo(object, covers, thumbnails) {
   const parts = object.key.split("/");
   const filename = parts.pop();
   const folder = parts.join("/");
@@ -108,21 +155,96 @@ function makeVideo(object, covers) {
 
   const seriesParts = parts.slice(1);
 
+  const videoMatchKey =
+    object.key
+      .toLowerCase()
+      .replace(/\.mp4$/, "");
+
+  const videoThumbnailUrl =
+    thumbnails.get(videoMatchKey) || "";
+
   return {
     key: object.key,
     section: sectionFolder,
+
     series:
       seriesParts.length > 0
         ? seriesParts.join(" / ")
         : sectionFolder,
+
     title: cleanTitle(filename),
+
     coverUrl:
-      folder
-        ? (covers.get(folder) || "")
-        : "",
+      videoThumbnailUrl ||
+      (
+        folder
+          ? covers.get(folder) || ""
+          : ""
+      ),
+
     sectionCoverUrl:
-      covers.get(sectionFolder) || ""
+      covers.get(sectionFolder) || "",
+
+    uploaded:
+      object.uploaded
+        ? new Date(object.uploaded).getTime()
+        : 0
   };
+}
+
+function addLatestStream(videos) {
+  const catalog =
+    videos.map((video) => ({ ...video }));
+
+  // Keep the newest Traditional and newest
+  // Contemporary service in Latest Stream.
+  for (const serviceRank of [1, 2]) {
+    const serviceVideos = videos.filter(
+      (video) =>
+        sectionRank(video.section) === serviceRank
+    );
+
+    if (serviceVideos.length === 0) {
+      continue;
+    }
+
+    const latest = serviceVideos.reduce(
+      (newest, video) => {
+        if (!newest) {
+          return video;
+        }
+
+        if (video.uploaded > newest.uploaded) {
+          return video;
+        }
+
+        if (
+          video.uploaded === newest.uploaded &&
+          video.key > newest.key
+        ) {
+          return video;
+        }
+
+        return newest;
+      },
+      null
+    );
+
+    catalog.push({
+      ...latest,
+      section: "Latest Stream",
+      series: "Latest Stream",
+      description: latest.section,
+
+      sectionCoverUrl:
+        latest.coverUrl ||
+        latest.sectionCoverUrl,
+
+      latestOrder: serviceRank
+    });
+  }
+
+  return catalog;
 }
 
 function cleanTitle(filename) {
@@ -135,7 +257,8 @@ function cleanTitle(filename) {
 
 function sortVideos(a, b) {
   const sectionDifference =
-    sectionRank(a.section) - sectionRank(b.section);
+    sectionRank(a.section) -
+    sectionRank(b.section);
 
   if (sectionDifference !== 0) {
     return sectionDifference;
@@ -143,6 +266,16 @@ function sortVideos(a, b) {
 
   if (a.section !== b.section) {
     return a.section.localeCompare(b.section);
+  }
+
+  if (
+    a.section === "Latest Stream" &&
+    b.section === "Latest Stream"
+  ) {
+    return (
+      (a.latestOrder || 99) -
+      (b.latestOrder || 99)
+    );
   }
 
   if (a.series !== b.series) {
@@ -160,17 +293,33 @@ function sortVideos(a, b) {
 }
 
 function sectionRank(name) {
-  const normalized = name.toLowerCase();
+  const normalized = String(name ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
 
-  if (normalized.startsWith("traditional")) {
+  if (normalized === "lateststream") {
+    return 0;
+  }
+
+  // Also recognizes the current "Traditonal" spelling.
+  if (
+    normalized.includes("tradit") ||
+    normalized.includes("930")
+  ) {
     return 1;
   }
 
-  if (normalized.startsWith("contemporary")) {
+  if (
+    normalized.includes("contemp") ||
+    normalized.includes("1030")
+  ) {
     return 2;
   }
 
-  if (normalized.startsWith("sermon")) {
+  if (
+    normalized.includes("sermon") ||
+    normalized.includes("message")
+  ) {
     return 3;
   }
 
@@ -178,28 +327,36 @@ function sectionRank(name) {
 }
 
 function buildMRSS(videos) {
-  const items = videos.map((video) => {
-    const videoUrl =
-      PUBLIC_R2_BASE +
-      "/" +
-      encodeObjectKey(video.key);
+  const items = videos
+    .map((video) => {
+      const videoUrl =
+        PUBLIC_R2_BASE +
+        "/" +
+        encodeObjectKey(video.key);
 
-    const guid =
-      "vumc-" +
-      simpleSlug(video.key);
+      const guid =
+        "vumc-" +
+        simpleSlug(video.key);
 
-    const thumbnail = video.coverUrl
-      ? `<media:thumbnail url="${xmlEscape(video.coverUrl)}" />`
-      : "";
+      const thumbnail = video.coverUrl
+        ? `<media:thumbnail url="${xmlEscape(
+            video.coverUrl
+          )}" />`
+        : "";
 
-    const sectionThumbnail = video.sectionCoverUrl
-      ? `<vumc:sectionThumbnail url="${xmlEscape(video.sectionCoverUrl)}" />`
-      : "";
+      const sectionThumbnail =
+        video.sectionCoverUrl
+          ? `<vumc:sectionThumbnail url="${xmlEscape(
+              video.sectionCoverUrl
+            )}" />`
+          : "";
 
-    return `
+      return `
     <item>
       <title>${xmlEscape(video.title)}</title>
-      <description>${xmlEscape(video.series)}</description>
+      <description>${xmlEscape(
+        video.description || video.series
+      )}</description>
       <category>${xmlEscape(video.series)}</category>
       <vumc:section>${xmlEscape(video.section)}</vumc:section>
       ${sectionThumbnail}
@@ -210,7 +367,8 @@ function buildMRSS(videos) {
         type="video/mp4"
       />
     </item>`;
-  }).join("");
+    })
+    .join("");
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <rss
