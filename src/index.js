@@ -2,8 +2,14 @@ const PUBLIC_R2_BASE =
   "https://pub-b27dbb9301fa4d12b052a98a92aabbaf.r2.dev";
 
 const COVER_FILENAMES = new Set([
-  "poster.jpg", "poster.jpeg", "poster.png", "poster.webp",
-  "cover.jpg", "cover.jpeg", "cover.png", "cover.webp"
+  "poster.jpg",
+  "poster.jpeg",
+  "poster.png",
+  "poster.webp",
+  "cover.jpg",
+  "cover.jpeg",
+  "cover.png",
+  "cover.webp"
 ]);
 
 const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp"];
@@ -34,10 +40,11 @@ export default {
         )
         .map((object) =>
           makeVideo(object, covers, thumbnails)
-        );
+        )
+        .filter((video) => video !== null);
 
-      const videos =
-        addLatestStream(sourceVideos).sort(sortVideos);
+      const videos = addLatestStream(sourceVideos)
+        .sort(sortVideos);
 
       return new Response(buildMRSS(videos), {
         headers: {
@@ -60,7 +67,9 @@ async function listAllObjects(bucket) {
   let cursor;
 
   do {
-    const options = { limit: 1000 };
+    const options = {
+      limit: 1000
+    };
 
     if (cursor) {
       options.cursor = cursor;
@@ -121,14 +130,15 @@ function buildThumbnailMap(objects) {
     const parts = key.split("/");
     const filename = parts.pop();
 
-    // These remain folder/category artwork.
+    // poster.* and cover.* are reserved for folder artwork.
     if (COVER_FILENAMES.has(filename.toLowerCase())) {
       continue;
     }
 
-    // Remove the image extension to match the MP4 name.
-    const matchKey =
-      lowerKey.slice(0, -extension.length);
+    const matchKey = lowerKey.slice(
+      0,
+      -extension.length
+    );
 
     if (!thumbnails.has(matchKey)) {
       thumbnails.set(
@@ -148,60 +158,134 @@ function makeVideo(object, covers, thumbnails) {
   const filename = parts.pop();
   const folder = parts.join("/");
 
-  const sectionFolder =
-    parts.length > 0
-      ? parts[0]
-      : "Worship";
-
-  const seriesParts = parts.slice(1);
-
-  const videoMatchKey =
-    object.key
-      .toLowerCase()
-      .replace(/\.mp4$/, "");
+  const videoMatchKey = object.key
+    .toLowerCase()
+    .replace(/\.mp4$/, "");
 
   const videoThumbnailUrl =
     thumbnails.get(videoMatchKey) || "";
 
+  const rootFolder =
+    parts.length > 0 ? parts[0] : "";
+
+  const normalizedRoot =
+    normalizeName(rootFolder);
+
+  let section = "";
+  let service = "";
+  let series = "";
+  let category = "";
+  let description = "";
+  let latestServiceRank = 0;
+
+  if (
+    normalizedRoot === "currentsermonseries" ||
+    normalizedRoot === "currentseries"
+  ) {
+    service = displayServiceName(
+      parts.length > 1 ? parts[1] : ""
+    );
+
+    if (service === "") {
+      return null;
+    }
+
+    series =
+      parts.length > 2
+        ? parts.slice(2).join(" / ")
+        : "Current Series";
+
+    section = "Current Series";
+    category = service;
+    description = series;
+    latestServiceRank = serviceRank(service);
+  } else if (normalizedRoot === "library") {
+    service = displayServiceName(
+      parts.length > 1 ? parts[1] : ""
+    );
+
+    if (service === "") {
+      service = "Worship";
+    }
+
+    series =
+      parts.length > 2
+        ? parts.slice(2).join(" / ")
+        : service;
+
+    section = "Library";
+    category = series;
+    description = service;
+  } else {
+    /*
+     * Temporary backward compatibility:
+     * videos in old top-level Traditional or
+     * Contemporary folders will still be recognized
+     * while the R2 folders are being reorganized.
+     */
+    const legacyServiceRank =
+      serviceRank(rootFolder);
+
+    if (legacyServiceRank === 0) {
+      return null;
+    }
+
+    service = displayServiceName(rootFolder);
+
+    series =
+      parts.length > 1
+        ? parts.slice(1).join(" / ")
+        : "Current Series";
+
+    section = "Current Series";
+    category = service;
+    description = series;
+    latestServiceRank = legacyServiceRank;
+  }
+
   return {
     key: object.key,
-    section: sectionFolder,
-
-    series:
-      seriesParts.length > 0
-        ? seriesParts.join(" / ")
-        : sectionFolder,
-
+    section,
+    series: category,
+    description,
+    service,
+    latestServiceRank,
     title: cleanTitle(filename),
 
     coverUrl:
       videoThumbnailUrl ||
-      (
-        folder
-          ? covers.get(folder) || ""
-          : ""
-      ),
+      (folder ? covers.get(folder) || "" : ""),
+
+    seriesCoverUrl:
+      findNearestCover(parts, covers),
 
     sectionCoverUrl:
-      covers.get(sectionFolder) || "",
+      findNearestCover(parts.slice(0, 1), covers),
 
-    uploaded:
-      object.uploaded
-        ? new Date(object.uploaded).getTime()
-        : 0
+    uploaded: object.uploaded
+      ? new Date(object.uploaded).getTime()
+      : 0
   };
 }
 
 function addLatestStream(videos) {
-  const catalog =
-    videos.map((video) => ({ ...video }));
+  const catalog = videos.map(
+    (video) => ({ ...video })
+  );
 
-  // Keep the newest Traditional and newest
-  // Contemporary service in Latest Stream.
-  for (const serviceRank of [1, 2]) {
+  /*
+   * Rank 1 = Traditional Worship
+   * Rank 2 = Contemporary Worship
+   *
+   * Only videos under Current Sermon Series
+   * receive a latestServiceRank. Library videos
+   * therefore cannot appear under Latest Stream.
+   */
+  for (const serviceRankNumber of [1, 2]) {
     const serviceVideos = videos.filter(
       (video) =>
-        sectionRank(video.section) === serviceRank
+        video.latestServiceRank ===
+        serviceRankNumber
     );
 
     if (serviceVideos.length === 0) {
@@ -234,13 +318,17 @@ function addLatestStream(videos) {
       ...latest,
       section: "Latest Stream",
       series: "Latest Stream",
-      description: latest.section,
+      description: latest.service,
+
+      seriesCoverUrl:
+        latest.coverUrl ||
+        latest.seriesCoverUrl,
 
       sectionCoverUrl:
         latest.coverUrl ||
         latest.sectionCoverUrl,
 
-      latestOrder: serviceRank
+      latestOrder: serviceRankNumber
     });
   }
 
@@ -293,15 +381,32 @@ function sortVideos(a, b) {
 }
 
 function sectionRank(name) {
-  const normalized = String(name ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "");
+  const normalized = normalizeName(name);
 
   if (normalized === "lateststream") {
     return 0;
   }
 
-  // Also recognizes the current "Traditonal" spelling.
+  if (normalized === "currentseries") {
+    return 1;
+  }
+
+  if (normalized === "library") {
+    return 2;
+  }
+
+  return 10;
+}
+
+function normalizeName(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function serviceRank(name) {
+  const normalized = normalizeName(name);
+
   if (
     normalized.includes("tradit") ||
     normalized.includes("930")
@@ -316,14 +421,41 @@ function sectionRank(name) {
     return 2;
   }
 
-  if (
-    normalized.includes("sermon") ||
-    normalized.includes("message")
-  ) {
-    return 3;
+  return 0;
+}
+
+function displayServiceName(name) {
+  const rank = serviceRank(name);
+
+  if (rank === 1) {
+    return "Traditional Worship";
   }
 
-  return 10;
+  if (rank === 2) {
+    return "Contemporary Worship";
+  }
+
+  return String(name ?? "").trim();
+}
+
+function findNearestCover(folderParts, covers) {
+  for (
+    let length = folderParts.length;
+    length > 0;
+    length--
+  ) {
+    const folder = folderParts
+      .slice(0, length)
+      .join("/");
+
+    const cover = covers.get(folder);
+
+    if (cover) {
+      return cover;
+    }
+  }
+
+  return "";
 }
 
 function buildMRSS(videos) {
@@ -351,16 +483,30 @@ function buildMRSS(videos) {
             )}" />`
           : "";
 
+      const seriesThumbnail =
+        video.seriesCoverUrl
+          ? `<vumc:seriesThumbnail url="${xmlEscape(
+              video.seriesCoverUrl
+            )}" />`
+          : "";
+
       return `
     <item>
       <title>${xmlEscape(video.title)}</title>
       <description>${xmlEscape(
         video.description || video.series
       )}</description>
-      <category>${xmlEscape(video.series)}</category>
-      <vumc:section>${xmlEscape(video.section)}</vumc:section>
+      <category>${xmlEscape(
+        video.series
+      )}</category>
+      <vumc:section>${xmlEscape(
+        video.section
+      )}</vumc:section>
       ${sectionThumbnail}
-      <guid isPermaLink="false">${xmlEscape(guid)}</guid>
+      ${seriesThumbnail}
+      <guid isPermaLink="false">${xmlEscape(
+        guid
+      )}</guid>
       ${thumbnail}
       <media:content
         url="${xmlEscape(videoUrl)}"
@@ -380,8 +526,8 @@ function buildMRSS(videos) {
     <title>Versailles UMC Video Library</title>
     <link>https://www.versaillesumc.org</link>
     <description>
-      Worship services and sermon series
-      from Versailles United Methodist Church.
+      Worship services and sermon series from
+      Versailles United Methodist Church.
     </description>
     <language>en-us</language>
 ${items}
